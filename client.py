@@ -92,11 +92,12 @@ async def listen_to_server(ws):
                 print(f"\nSpectating room {data['room_id']}.")
 
             elif msg_type == 'reconnect_success':
-                STATE['room_id'] = data['room_id']
-                STATE['is_player'] = True
-                STATE['is_spectator'] = False
-                STATE['my_stone'] = data['your_stone']
-                print(f"\nReconnected successfully to room {data['room_id']}.")
+                if STATE.get('room_id') != data['room_id']:
+                    STATE['room_id'] = data['room_id']
+                    STATE['is_player'] = True
+                    STATE['is_spectator'] = False
+                    STATE['my_stone'] = data['your_stone']
+                    print(f"\nReconnected successfully to room {data['room_id']}.")
 
             elif msg_type == 'game_state':
                 STATE['board'] = data['board']
@@ -123,20 +124,30 @@ async def listen_to_server(ws):
                     print("\n*** It's YOUR turn! ***")
                 else:
                     print(f"\nTurn changed. Waiting for other player...")
+                if STATE['board']:
+                    print_board(STATE['board'])
             
-            elif msg_type == 'timer_update':
+            elif msg_type == 'timer_notification':
                 if STATE['game_state'] == 'IN_PROGRESS':
+                    player_name = data.get('player_name', 'Player')
+                    time_left = data['time_left']
                     if STATE['is_player'] and data['player'] == STATE['user_id']:
-                        print(f"\r[Your Timer]: {data['time_left']}s   ", end="")
-                        sys.stdout.flush()
+                        print(f"\n[Timer] {time_left} seconds remaining for your turn!")
                     else:
-                        print(f"\r[Opponent Timer]: {data['time_left']}s   ", end="")
-                        sys.stdout.flush()
+                        print(f"\n[Timer] {player_name} has {time_left} seconds remaining.")
 
             elif msg_type == 'game_over':
                 print(f"\n--- GAME OVER ---")
                 print(f"Winner: {data['winner_name']}")
-                STATE['game_state'] = 'FINISHED'
+                print("\nReturning to lobby...")
+                STATE['game_state'] = 'LOBBY'
+                STATE['room_id'] = None
+                STATE['is_player'] = False
+                STATE['is_spectator'] = False
+                STATE['board'] = []
+                STATE['current_turn'] = None
+                STATE['my_stone'] = 0
+                print("You are now in the lobby. Type 'list' to see available rooms or 'help' for commands.")
 
             elif msg_type == 'chat':
                 print(f"\n[Player Chat] {data['sender']}: {data['message']}")
@@ -180,6 +191,7 @@ async def handle_user_input(ws):
                 print("  create <name>: Create a new room")
                 print("  join <id>    : Join a room as a player")
                 print("  spectate <id>: Spectate a room")
+                print("  reconnect    : Reconnect to your active game session (User ID based)")
                 print("  move <r> <c> : Place your stone at (row, col)")
                 print("  chat <msg>   : Send a message to players/spectators")
                 print("  schat <msg>  : (Spectators Only) Send a message to spectators")
@@ -201,7 +213,16 @@ async def handle_user_input(ws):
                 elif cmd == 'join' and len(parts) > 1:
                     payload = {'type': 'join_room', 'room_id': parts[1], 'user_id': STATE['user_id'], 'user_name': STATE['user_name']}
                 elif cmd == 'spectate' and len(parts) > 1:
-                    payload = {'type': 'spectate_room', 'room_id': parts[1]}
+                    payload = {'type': 'spectate_room', 'room_id': parts[1], 'user_id': STATE['user_id'], 'user_name': STATE['user_name']}
+                elif cmd == 'reconnect':
+                    payload = {
+                        'type': 'reconnect',
+                        'user_id': STATE['user_id']
+                    }
+                    if STATE.get('room_id'):
+                        payload['room_id'] = STATE['room_id']
+                    if STATE.get('token'):
+                        payload['token'] = STATE['token']
                 else:
                     print("Invalid lobby command. Type 'help'.")
                     display_prompt()
@@ -223,8 +244,16 @@ async def handle_user_input(ws):
             
             elif STATE['is_spectator']:
                 if cmd == 'chat':
+                    if len(parts) < 2:
+                        print("Usage: chat <message>")
+                        display_prompt()
+                        continue
                     payload = {'type': 'chat', 'message': " ".join(parts[1:])}
                 elif cmd == 'schat':
+                    if len(parts) < 2:
+                        print("Usage: schat <message>")
+                        display_prompt()
+                        continue
                     payload = {'type': 'spectator_chat', 'message': " ".join(parts[1:])}
                 elif cmd == 'board':
                     print_board(STATE['board'])
@@ -248,33 +277,68 @@ async def handle_user_input(ws):
             break
 
 async def attempt_reconnection(uri):
-    print(f"Attempting to reconnect as {STATE['user_id']} to room {STATE['room_id']}...")
+    print(f"Attempting to reconnect as {STATE['user_id']}...")
+    ws = None
     try:
-        async with websockets.connect(uri) as ws:
-            payload = {
-                'type': 'reconnect',
-                'user_id': STATE['user_id'],
-                'room_id': STATE['room_id'],
-                'token': STATE['token']
-            }
-            await ws.send(json.dumps(payload))
+        ws = await websockets.connect(uri)
+        
+        payload = {
+            'type': 'reconnect',
+            'user_id': STATE['user_id']
+        }
+        if STATE.get('room_id'):
+            payload['room_id'] = STATE['room_id']
+        if STATE.get('token'):
+            payload['token'] = STATE['token']
+        
+        await ws.send(json.dumps(payload))
+        
+        response_str = await ws.recv()
+        response = json.loads(response_str)
+        
+        if response.get('type') == 'reconnect_success':
+            STATE['room_id'] = response['room_id']
+            STATE['is_player'] = True
+            STATE['is_spectator'] = False
+            STATE['my_stone'] = response['your_stone']
+            print(f"Reconnection successful! Reconnected to room {response['room_id']}.")
             
-            response_str = await ws.recv()
-            response = json.loads(response_str)
+            try:
+                game_state_str = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                game_state_data = json.loads(game_state_str)
+                if game_state_data.get('type') == 'game_state':
+                    STATE['board'] = game_state_data['board']
+                    STATE['current_turn'] = game_state_data['current_turn']
+                    STATE['game_state'] = game_state_data['game_state']
+                    print("\n--- Game State Restored ---")
+                    player_names = " vs ".join(game_state_data['players'].values())
+                    print(f"Players: {player_names}")
+                    print_board(STATE['board'])
+                    if game_state_data['game_state'] == 'IN_PROGRESS':
+                        turn_player_name = game_state_data['players'].get(game_state_data['current_turn'], 'Unknown')
+                        print(f"Current Turn: {turn_player_name}")
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                print(f"Warning: Could not receive game state: {e}")
             
-            if response.get('type') == 'reconnect_success':
-                print("Reconnection successful!")
-                return ws
-            else:
-                print(f"Reconnection failed: {response.get('message')}")
-                STATE['token'] = None
-                STATE['room_id'] = None
-                STATE['is_player'] = False
-                STATE['game_state'] = 'LOBBY'
-                return None
+            return ws
+        else:
+            print(f"Reconnection failed: {response.get('message')}")
+            await ws.close()
+            STATE['token'] = None
+            STATE['room_id'] = None
+            STATE['is_player'] = False
+            STATE['game_state'] = 'LOBBY'
+            return None
                 
     except Exception as e:
         print(f"Failed to reconnect: {e}")
+        if ws:
+            try:
+                await ws.close()
+            except:
+                pass
         return None
 
 async def main():
@@ -292,7 +356,7 @@ async def main():
 
         ws_connection = None
         try:
-            if STATE['token'] and STATE['room_id']:
+            if STATE['user_id']:
                 ws_connection = await attempt_reconnection(uri)
                 if not ws_connection:
                     print("Could not reconnect, returning to lobby.")
@@ -315,7 +379,7 @@ async def main():
 
         except websockets.exceptions.ConnectionClosed as e:
             print(f"\nConnection lost (Code: {e.code}).")
-            if STATE['is_player'] and STATE['token'] and STATE['game_state'] == 'IN_PROGRESS':
+            if STATE['is_player'] and STATE['user_id'] and STATE['game_state'] == 'IN_PROGRESS':
                 print(f"Will attempt to reconnect in 5 seconds...")
                 await asyncio.sleep(5)
             else:

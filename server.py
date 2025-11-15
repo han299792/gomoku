@@ -13,7 +13,7 @@ class GameRoom:
         self.room_id = room_id
         self.name = name
         self.players = {}
-        self.spectators = set()
+        self.spectators = {}
         self.board = [[0 for _ in range(15)] for _ in range(15)]
         self.current_turn_uid = None
         self.game_state = 'WAITING'
@@ -55,22 +55,22 @@ class GameRoom:
                 clients.append(p['ws'])
         
         if include_spectators:
-            for ws in self.spectators:
+            for ws in self.spectators.keys():
                 if ws != exclude_ws:
                     clients.append(ws)
 
-        tasks = [client.send(json.dumps(message)) for client in clients if client.open]
+        tasks = [send_message(client, message) for client in clients]
         if tasks:
-            await asyncio.wait(tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def broadcast_to_spectators(self, message, exclude_ws=None):
         clients = []
-        for ws in self.spectators:
+        for ws in self.spectators.keys():
             if ws != exclude_ws:
                 clients.append(ws)
-        tasks = [client.send(json.dumps(message)) for client in clients if client.open]
+        tasks = [send_message(client, message) for client in clients]
         if tasks:
-            await asyncio.wait(tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def add_player(self, ws, user_id, user_name):
         if len(self.players) >= 2:
@@ -93,20 +93,29 @@ class GameRoom:
         if len(self.players) == 2:
             await self.start_game()
 
-    async def add_spectator(self, ws):
-        self.spectators.add(ws)
+    async def add_spectator(self, ws, user_id=None, user_name=None):
+        self.spectators[ws] = {
+            'user_id': user_id or f'spec_{id(ws) % 10000}',
+            'user_name': user_name or f'Spectator-{id(ws) % 1000}'
+        }
         await ws.send(json.dumps({'type': 'spectate_success', 'room_id': self.room_id}))
         await ws.send(json.dumps(self.get_full_game_state()))
         await self.broadcast_room_info()
 
-    async def handle_reconnection(self, ws, user_id, token):
+    async def handle_reconnection(self, ws, user_id, token=None):
         if user_id not in self.players:
             await ws.send(json.dumps({'type': 'error', 'message': 'Invalid user ID for this room.'}))
             return
-            
-        if user_id not in self.player_tokens or self.player_tokens[user_id] != token:
-            await ws.send(json.dumps({'type': 'error', 'message': 'Invalid reconnection token.'}))
-            return
+        
+        if token:
+            if user_id not in self.player_tokens or self.player_tokens[user_id] != token:
+                await ws.send(json.dumps({'type': 'error', 'message': 'Invalid reconnection token.'}))
+                return
+        else:
+            if self.game_state != 'IN_PROGRESS' or self.players[user_id]['ws'] is not None:
+                if user_id not in self.reconnection_timers:
+                    await ws.send(json.dumps({'type': 'error', 'message': 'No active reconnection session found. Please provide token.'}))
+                    return
 
         if user_id in self.reconnection_timers:
             self.reconnection_timers[user_id].cancel()
@@ -134,19 +143,28 @@ class GameRoom:
         print(f"Game started in room {self.room_id}")
 
     async def start_move_timer(self):
-        if self.timer_task:
+        if self.timer_task and not self.timer_task.done():
             self.timer_task.cancel()
+            try:
+                await self.timer_task
+            except asyncio.CancelledError:
+                pass
             
         self.timer_task = asyncio.create_task(self.move_timer_logic())
 
     async def move_timer_logic(self):
         try:
+            if self.current_turn_uid not in self.players:
+                return
             current_player_name = self.players[self.current_turn_uid]['name']
             for i in range(MOVE_TIMER_DURATION, -1, -1):
-                await self.broadcast({'type': 'timer_update', 'player': self.current_turn_uid, 'time_left': i})
+                if self.game_state != 'IN_PROGRESS' or self.current_turn_uid not in self.players:
+                    return
+                if i == 10:
+                    await self.broadcast({'type': 'timer_notification', 'player': self.current_turn_uid, 'time_left': i, 'player_name': current_player_name})
                 await asyncio.sleep(1)
             
-            if self.game_state == 'IN_PROGRESS':
+            if self.game_state == 'IN_PROGRESS' and self.current_turn_uid in self.players:
                 await self.broadcast({'type': 'chat', 'sender': 'System', 'message': f"Player {current_player_name} ran out of time. Turn skipped."})
                 await self.next_turn()
         except asyncio.CancelledError:
@@ -194,6 +212,13 @@ class GameRoom:
         except:
             return
 
+        if self.timer_task and not self.timer_task.done():
+            self.timer_task.cancel()
+            try:
+                await self.timer_task
+            except asyncio.CancelledError:
+                pass
+
         stone = self.players[user_id]['stone']
         self.board[r][c] = stone
         
@@ -202,8 +227,6 @@ class GameRoom:
         if win_line:
             self.game_state = 'FINISHED'
             self.win_line = win_line
-            if self.timer_task:
-                self.timer_task.cancel()
             
             winner_name = self.players[user_id]['name']
             message = self.get_full_game_state()
@@ -231,9 +254,13 @@ class GameRoom:
         await self.broadcast(chat_msg)
         
     async def handle_spectator_chat(self, ws, message):
-        sender_name = f"Spectator-{id(ws) % 1000}"
+        if ws not in self.spectators:
+            await send_message(ws, {'type': 'error', 'message': 'Only spectators can use spectator chat.'})
+            return
+        
+        sender_name = self.spectators[ws]['user_name']
         chat_msg = {'type': 'spectator_chat', 'sender': sender_name, 'message': message}
-        await self.broadcast_to_spectators(chat_msg)
+        await self.broadcast_to_spectators(chat_msg, exclude_ws=None)
 
     async def handle_client_disconnect(self, ws, user_id):
         if user_id in self.players:
@@ -251,7 +278,7 @@ class GameRoom:
                 await self.broadcast_room_info()
 
         elif ws in self.spectators:
-            self.spectators.remove(ws)
+            del self.spectators[ws]
             await self.broadcast_room_info()
         
         print(f"Client {user_id or id(ws)} disconnected from room {self.room_id}")
@@ -306,7 +333,16 @@ async def send_room_list(ws):
     room_list = [room.get_room_info() for room in GAME_ROOMS.values()]
     await send_message(ws, {'type': 'room_list', 'rooms': room_list})
 
-async def handle_connection(websocket, path):
+def find_room_by_user_id(user_id):
+    for room_id, room in GAME_ROOMS.items():
+        if user_id in room.players:
+            if room.game_state == 'IN_PROGRESS' and (room.players[user_id]['ws'] is None or user_id in room.reconnection_timers):
+                return room_id, room
+            elif user_id in room.player_tokens:
+                return room_id, room
+    return None, None
+
+async def handle_connection(websocket):
     ALL_CLIENTS[websocket] = {'room_id': None, 'user_id': None}
     print(f"New client connected: {websocket.remote_address}")
     
@@ -364,21 +400,38 @@ async def handle_connection(websocket, path):
 
                     elif msg_type == 'spectate_room':
                         room_id = data.get('room_id')
+                        user_id = data.get('user_id')
+                        user_name = data.get('user_name')
                         if room_id in GAME_ROOMS:
                             client_info['room_id'] = room_id
-                            await GAME_ROOMS[room_id].add_spectator(websocket)
+                            client_info['user_id'] = user_id
+                            await GAME_ROOMS[room_id].add_spectator(websocket, user_id, user_name)
                         else:
                             await send_message(websocket, {'type': 'error', 'message': 'Room not found.'})
 
                     elif msg_type == 'reconnect':
-                        room_id = data.get('room_id')
                         user_id = data.get('user_id')
                         token = data.get('token')
+                        room_id = data.get('room_id')
                         
-                        if room_id in GAME_ROOMS:
-                            await GAME_ROOMS[room_id].handle_reconnection(websocket, user_id, token)
+                        if not user_id:
+                            await send_message(websocket, {'type': 'error', 'message': 'User ID is required for reconnection.'})
+                            continue
+                        
+                        if room_id and room_id in GAME_ROOMS:
+                            target_room = GAME_ROOMS[room_id]
                         else:
-                            await send_message(websocket, {'type': 'error', 'message': 'Room not found for reconnection.'})
+                            found_room_id, target_room = find_room_by_user_id(user_id)
+                            if target_room:
+                                room_id = found_room_id
+                            else:
+                                await send_message(websocket, {'type': 'error', 'message': f'No active game session found for user ID: {user_id}'})
+                                continue
+                        
+                        client_info['room_id'] = room_id
+                        client_info['user_id'] = user_id
+                        
+                        await target_room.handle_reconnection(websocket, user_id, token)
 
             except json.JSONDecodeError:
                 print(f"Invalid JSON from {websocket.remote_address}")
